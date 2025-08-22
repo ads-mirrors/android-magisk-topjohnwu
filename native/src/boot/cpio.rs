@@ -6,6 +6,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::size_of;
+use std::ops::Deref;
 use std::process::exit;
 use std::str;
 
@@ -705,10 +706,11 @@ impl CpioEntry {
             return false;
         }
 
-        let mut decoder = get_decoder(FileFormat::XZ, Vec::new());
         let Ok(data): std::io::Result<Vec<u8>> = (try {
-            decoder.write_all(&self.data)?;
-            decoder.finish()?
+            let mut decoder = get_decoder(FileFormat::XZ, self.data.deref());
+            let mut buf = Vec::new();
+            std::io::copy(&mut decoder, &mut buf)?;
+            buf
         }) else {
             eprintln!("xz compression failed");
             return false;

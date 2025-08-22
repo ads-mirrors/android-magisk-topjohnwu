@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, Read, Seek, SeekFrom, Write},
     os::fd::FromRawFd,
 };
-
+use std::ops::Deref;
 use crate::compress::get_decoder;
 use crate::ffi::check_fmt;
 use crate::proto::update_metadata::{DeltaArchiveManifest, mod_InstallOperation::Type};
@@ -164,9 +164,9 @@ pub fn extract_boot_from_payload(
             }
             Type::REPLACE_BZ | Type::REPLACE_XZ => {
                 out_file.seek(SeekFrom::Start(out_offset))?;
-                let mut decoder = get_decoder(check_fmt(data), &mut out_file);
+                let mut decoder = get_decoder(check_fmt(data), data.deref());
                 let Ok(_): std::io::Result<()> = (try {
-                    decoder.write_all(data)?;
+                    std::io::copy(&mut decoder, &mut out_file)?;
                 }) else {
                     return Err(bad_payload!("decompression failed"));
                 };

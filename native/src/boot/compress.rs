@@ -2,14 +2,13 @@ use crate::ffi::{FileFormat, check_fmt};
 use base::libc::{O_RDONLY, O_TRUNC, O_WRONLY};
 use base::{Chunker, LoggedResult, Utf8CStr, WriteExt, error, log_err};
 use bytemuck::bytes_of_mut;
-use bzip2::{Compression as BzCompression, write::BzDecoder, write::BzEncoder};
-use flate2::{Compression as GzCompression, write::GzEncoder, write::MultiGzDecoder};
+use bzip2::{Compression as BzCompression, read::BzDecoder, write::BzEncoder};
+use flate2::{Compression as GzCompression, write::GzEncoder, read::MultiGzDecoder};
 use lz4::{
     BlockMode, BlockSize, ContentChecksum, Encoder as LZ4FrameEncoder,
     EncoderBuilder as LZ4FrameEncoderBuilder, block::CompressionMode, liblz4::BlockChecksum,
 };
 use lzma_rust2::{CheckType, LZMAOptions, LZMAReader, LZMAWriter, XZOptions, XZReader, XZWriter};
-use std::cell::Cell;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write, stdin, stdout};
 use std::mem::ManuallyDrop;
@@ -36,23 +35,10 @@ macro_rules! finish_impl {
 
 finish_impl!(
     GzEncoder<W>,
-    MultiGzDecoder<W>,
     BzEncoder<W>,
     XZWriter<W>,
     LZMAWriter<W>
 );
-
-macro_rules! finish_impl_ref {
-    ($($t:ty),*) => {$(
-        impl<W: Write> WriteFinish<W> for $t {
-            fn finish(mut self: Box<Self>) -> std::io::Result<W> {
-                Self::finish(self.as_mut())
-            }
-        }
-    )*}
-}
-
-finish_impl_ref!(BzDecoder<W>);
 
 impl<W: Write> WriteFinish<W> for BufWriter<ZopFliEncoder<W>> {
     fn finish(self: Box<Self>) -> std::io::Result<W> {
@@ -69,165 +55,6 @@ impl<W: Write> WriteFinish<W> for LZ4FrameEncoder<W> {
     }
 }
 
-// Adapt Reader to Writer
-
-// In case some decoders don't support the Write trait, instead of pushing data into the
-// decoder, we have no choice but to pull data out of it. So first, we create a "fake" reader
-// that does not own any data as a placeholder. In the Writer adapter struct, when data
-// is fed in, we call FakeReader::set_data to forward this data as the "source" of the
-// decoder. Next, we pull data out of the decoder, and finally, forward the decoded data to output.
-
-struct FakeReader(Cell<&'static [u8]>);
-
-impl FakeReader {
-    fn new() -> FakeReader {
-        FakeReader(Cell::new(&[]))
-    }
-
-    // SAFETY: the lifetime of the buffer is between the invocation of
-    // this method and the invocation of FakeReader::clear. There is currently
-    // no way to represent this with Rust's lifetime marker, so we transmute all
-    // lifetimes away and make the users of this struct manually manage the lifetime.
-    // It is the responsibility of the caller to ensure the underlying reference does not
-    // live longer than it should.
-    unsafe fn set_data(&self, data: &[u8]) {
-        let buf: &'static [u8] = unsafe { std::mem::transmute(data) };
-        self.0.set(buf)
-    }
-
-    fn clear(&self) {
-        self.0.set(&[])
-    }
-}
-
-impl Read for FakeReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let data = self.0.get();
-        let len = std::cmp::min(buf.len(), data.len());
-        buf[..len].copy_from_slice(&data[..len]);
-        self.0.set(&data[len..]);
-        Ok(len)
-    }
-}
-
-// LZMA Decoder
-struct LZMADecoder<W: Write> {
-    write: W,
-    decoder: LZMAReader<FakeReader>,
-}
-
-impl<W: Write> LZMADecoder<W> {
-    fn new(write: W) -> Self {
-        let fake = FakeReader::new();
-        let decoder = LZMAReader::new_mem_limit(fake, u32::MAX, None).unwrap();
-        LZMADecoder { write, decoder }
-    }
-}
-
-impl<W: Write> Write for LZMADecoder<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        unsafe { self.decoder.inner().set_data(buf) };
-        std::io::copy(&mut self.decoder, &mut self.write)?;
-        self.decoder.inner().clear();
-        Ok(())
-    }
-}
-
-impl<W: Write> WriteFinish<W> for LZMADecoder<W> {
-    fn finish(self: Box<Self>) -> std::io::Result<W> {
-        Ok(self.write)
-    }
-}
-
-// XZ Decoder
-struct XZDecoder<W: Write> {
-    write: W,
-    decoder: XZReader<FakeReader>,
-}
-
-impl<W: Write> XZDecoder<W> {
-    fn new(write: W) -> Self {
-        let fake = FakeReader::new();
-        let decoder = XZReader::new(fake, true);
-        XZDecoder { write, decoder }
-    }
-}
-
-impl<W: Write> Write for XZDecoder<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        unsafe { self.decoder.inner().set_data(buf) };
-        std::io::copy(&mut self.decoder, &mut self.write)?;
-        self.decoder.inner().clear();
-        Ok(())
-    }
-}
-
-impl<W: Write> WriteFinish<W> for XZDecoder<W> {
-    fn finish(self: Box<Self>) -> std::io::Result<W> {
-        Ok(self.write)
-    }
-}
-
-// LZ4FrameDecoder
-
-struct LZ4FrameDecoder<W: Write> {
-    write: W,
-    decoder: lz4::Decoder<FakeReader>,
-}
-
-impl<W: Write> LZ4FrameDecoder<W> {
-    fn new(write: W) -> Self {
-        let fake = FakeReader::new();
-        let decoder = lz4::Decoder::new(fake).unwrap();
-        LZ4FrameDecoder { write, decoder }
-    }
-}
-
-impl<W: Write> Write for LZ4FrameDecoder<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        // SAFETY: buf is removed from the reader immediately after usage
-        unsafe { self.decoder.reader().set_data(buf) };
-        std::io::copy(&mut self.decoder, &mut self.write)?;
-        self.decoder.reader().clear();
-        Ok(())
-    }
-}
-
-impl<W: Write> WriteFinish<W> for LZ4FrameDecoder<W> {
-    fn finish(self: Box<Self>) -> std::io::Result<W> {
-        let (_, r) = self.decoder.finish();
-        r?;
-        Ok(self.write)
-    }
-}
-
 // LZ4BlockArchive format
 //
 // len:  |   4   |          4            |           n           | ... |           4             |
@@ -237,9 +64,9 @@ impl<W: Write> WriteFinish<W> for LZ4FrameDecoder<W> {
 
 const LZ4_BLOCK_SIZE: usize = 0x800000;
 const LZ4HC_CLEVEL_MAX: i32 = 12;
-const LZ4_MAGIC: &[u8] = b"\x02\x21\x4c\x18";
+const LZ4_MAGIC: u32 = 0x184c2102;
 
-struct LZ4BlockEncoder<W: Write> {
+struct LZ4LegacyEncoder<W: Write> {
     write: W,
     chunker: Chunker,
     out_buf: Box<[u8]>,
@@ -247,10 +74,10 @@ struct LZ4BlockEncoder<W: Write> {
     is_lg: bool,
 }
 
-impl<W: Write> LZ4BlockEncoder<W> {
+impl<W: Write> LZ4LegacyEncoder<W> {
     fn new(write: W, is_lg: bool) -> Self {
         let out_sz = lz4::block::compress_bound(LZ4_BLOCK_SIZE).unwrap_or(LZ4_BLOCK_SIZE);
-        LZ4BlockEncoder {
+        Self {
             write,
             chunker: Chunker::new(LZ4_BLOCK_SIZE),
             // SAFETY: all bytes will be initialized before it is used
@@ -273,7 +100,7 @@ impl<W: Write> LZ4BlockEncoder<W> {
     }
 }
 
-impl<W: Write> Write for LZ4BlockEncoder<W> {
+impl<W: Write> Write for LZ4LegacyEncoder<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.write_all(buf)?;
         Ok(buf.len())
@@ -286,7 +113,7 @@ impl<W: Write> Write for LZ4BlockEncoder<W> {
     fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
         if self.total == 0 {
             // Write header
-            self.write.write_all(LZ4_MAGIC)?;
+            self.write.write_pod(&LZ4_MAGIC)?;
         }
 
         self.total += buf.len() as u32;
@@ -301,7 +128,7 @@ impl<W: Write> Write for LZ4BlockEncoder<W> {
     }
 }
 
-impl<W: Write> WriteFinish<W> for LZ4BlockEncoder<W> {
+impl<W: Write> WriteFinish<W> for LZ4LegacyEncoder<W> {
     fn finish(mut self: Box<Self>) -> std::io::Result<W> {
         let chunk = self.chunker.get_available();
         if !chunk.is_empty() {
@@ -316,88 +143,56 @@ impl<W: Write> WriteFinish<W> for LZ4BlockEncoder<W> {
 
 // LZ4BlockDecoder
 
-struct LZ4BlockDecoder<W: Write> {
-    write: W,
-    chunker: Chunker,
-    out_buf: Box<[u8]>,
-    curr_block_size: usize,
+struct LZ4LegacyDecoder<R: Read> {
+    read: R,
+    remaining: Vec<u8>,
+    offset: usize,
 }
 
-impl<W: Write> LZ4BlockDecoder<W> {
-    fn new(write: W) -> Self {
-        LZ4BlockDecoder {
-            write,
-            chunker: Chunker::new(size_of::<u32>()),
-            // SAFETY: all bytes will be initialized before it is used
-            out_buf: unsafe { Box::new_uninit_slice(LZ4_BLOCK_SIZE).assume_init() },
-            curr_block_size: 0,
+impl<R: Read> LZ4LegacyDecoder<R> {
+    fn new(read: R) -> Self {
+         Self {
+             read,
+             // SAFETY: all bytes will be initialized before it is used
+             remaining: vec![],
+             offset: 0,
         }
     }
-
-    fn decode_block(write: &mut W, out_buf: &mut [u8], chunk: &[u8]) -> std::io::Result<()> {
-        let decompressed_size =
-            lz4::block::decompress_to_buffer(chunk, Some(LZ4_BLOCK_SIZE as i32), out_buf)?;
-        write.write_all(&out_buf[..decompressed_size])
-    }
 }
 
-impl<W: Write> Write for LZ4BlockDecoder<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
-        while !buf.is_empty() {
-            let (b, chunk) = self.chunker.add_data(buf);
-            buf = b;
-            if let Some(chunk) = chunk {
-                if chunk == LZ4_MAGIC {
-                    // Skip magic, read next u32
-                    continue;
+impl<R: Read> Read for LZ4LegacyDecoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.offset == self.remaining.len() {
+            let mut block_size: u32 = 0;
+            if let Err(e) = self.read.read_exact(bytes_of_mut(&mut block_size)) {
+                return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Ok(0)
+                } else {
+                    Err(e)
                 }
-                if self.curr_block_size == 0 {
-                    // We haven't got the current block size yet, try read it
-                    let mut next_u32: u32 = 0;
-                    bytes_of_mut(&mut next_u32).copy_from_slice(chunk);
-
-                    if next_u32 > lz4::block::compress_bound(LZ4_BLOCK_SIZE)? as u32 {
-                        // This is the LG format trailer, EOF
-                        continue;
-                    }
-
-                    // Update chunker to read next block
-                    self.curr_block_size = next_u32 as usize;
-                    self.chunker.set_chunk_size(self.curr_block_size);
-                    continue;
-                }
-
-                // Actually decode the block
-                Self::decode_block(&mut self.write, &mut self.out_buf, chunk)?;
-
-                // Reset for the next block
-                self.curr_block_size = 0;
-                self.chunker.set_chunk_size(size_of::<u32>());
             }
+            if block_size == LZ4_MAGIC {
+                self.read.read_exact(bytes_of_mut(&mut block_size))?;
+            }
+            unsafe { self.remaining.set_len(0) };
+            self.remaining.reserve(LZ4_BLOCK_SIZE);
+            unsafe { self.remaining.set_len(LZ4_BLOCK_SIZE) };
+            let mut test_byte = [0u8; 1];
+            if let Ok(0) = self.read.read(&mut test_byte) {
+                return Ok(0);
+            }
+            let mut src = Vec::with_capacity(block_size as usize);
+            unsafe { src.set_len(block_size as usize) };
+            src[0] = test_byte[0];
+            self.read.read_exact(&mut src[1..])?;
+            let sz = lz4::block::decompress_to_buffer(&src, Some(LZ4_BLOCK_SIZE as i32), &mut self.remaining)?;
+            self.remaining.truncate(sz);
+            self.offset = 0;
         }
-        Ok(())
-    }
-}
-
-impl<W: Write> WriteFinish<W> for LZ4BlockDecoder<W> {
-    fn finish(mut self: Box<Self>) -> std::io::Result<W> {
-        let chunk = self.chunker.get_available();
-        if !chunk.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Finish ran before end of compressed stream",
-            ));
-        }
-        Ok(self.write)
+        let to_copy = (self.remaining.len() - self.offset).min(buf.len());
+        buf[..to_copy].copy_from_slice(&self.remaining[self.offset..self.offset + to_copy]);
+        self.offset += to_copy;
+        Ok(to_copy)
     }
 }
 
@@ -426,8 +221,8 @@ pub fn get_encoder<'a, W: Write + 'a>(format: FileFormat, w: W) -> Box<dyn Write
                 .unwrap();
             Box::new(encoder)
         }
-        FileFormat::LZ4_LEGACY => Box::new(LZ4BlockEncoder::new(w, false)),
-        FileFormat::LZ4_LG => Box::new(LZ4BlockEncoder::new(w, true)),
+        FileFormat::LZ4_LEGACY => Box::new(LZ4LegacyEncoder::new(w, false)),
+        FileFormat::LZ4_LG => Box::new(LZ4LegacyEncoder::new(w, true)),
         FileFormat::ZOPFLI => {
             // These options are already better than gzip -9
             let opt = ZopfliOptions {
@@ -442,14 +237,14 @@ pub fn get_encoder<'a, W: Write + 'a>(format: FileFormat, w: W) -> Box<dyn Write
     }
 }
 
-pub fn get_decoder<'a, W: Write + 'a>(format: FileFormat, w: W) -> Box<dyn WriteFinish<W> + 'a> {
+pub fn get_decoder<'a, R: Read + 'a>(format: FileFormat, r: R) -> Box<dyn Read + 'a> {
     match format {
-        FileFormat::XZ => Box::new(XZDecoder::new(w)),
-        FileFormat::LZMA => Box::new(LZMADecoder::new(w)),
-        FileFormat::BZIP2 => Box::new(BzDecoder::new(w)),
-        FileFormat::LZ4 => Box::new(LZ4FrameDecoder::new(w)),
-        FileFormat::LZ4_LG | FileFormat::LZ4_LEGACY => Box::new(LZ4BlockDecoder::new(w)),
-        FileFormat::ZOPFLI | FileFormat::GZIP => Box::new(MultiGzDecoder::new(w)),
+        FileFormat::XZ => Box::new(XZReader::new(r, true)),
+        FileFormat::LZMA => Box::new(LZMAReader::new_mem_limit(r, u32::MAX, None).unwrap()),
+        FileFormat::BZIP2 => Box::new(BzDecoder::new(r)),
+        FileFormat::LZ4 => Box::new(lz4::Decoder::new(r).unwrap()),
+        FileFormat::LZ4_LG | FileFormat::LZ4_LEGACY => Box::new(LZ4LegacyDecoder::new(r)),
+        FileFormat::ZOPFLI | FileFormat::GZIP => Box::new(MultiGzDecoder::new(r)),
         _ => unreachable!(),
     }
 }
@@ -471,11 +266,25 @@ pub fn decompress_bytes_fd(format: FileFormat, in_bytes: &[u8], in_fd: RawFd, ou
     let mut in_file = unsafe { ManuallyDrop::new(File::from_raw_fd(in_fd)) };
     let mut out_file = unsafe { ManuallyDrop::new(File::from_raw_fd(out_fd)) };
 
-    let mut decoder = get_decoder(format, out_file.deref_mut());
+    struct ConcatReader<'a> (&'a [u8], &'a File);
+
+    impl Read for ConcatReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.0.is_empty() {
+                let len = self.0.len().min(buf.len());
+                buf[..len].copy_from_slice(&self.0[..len]);
+                self.0 = &self.0[len..];
+                Ok(len)
+            } else {
+                self.1.read(buf)
+            }
+        }
+    }
+
+    let mut reader = ConcatReader(in_bytes, in_file.deref_mut());
+    let mut decoder = get_decoder(format, &mut reader);
     let _: LoggedResult<()> = try {
-        decoder.write_all(in_bytes)?;
-        std::io::copy(in_file.deref_mut(), decoder.as_mut())?;
-        decoder.finish()?;
+        std::io::copy(decoder.as_mut(), out_file.deref_mut())?;
     };
 }
 
@@ -492,10 +301,9 @@ pub fn compress_bytes(format: FileFormat, in_bytes: &[u8], out_fd: RawFd) {
 pub fn decompress_bytes(format: FileFormat, in_bytes: &[u8], out_fd: RawFd) {
     let mut out_file = unsafe { ManuallyDrop::new(File::from_raw_fd(out_fd)) };
 
-    let mut decoder = get_decoder(format, out_file.deref_mut());
+    let mut decoder = get_decoder(format, in_bytes);
     let _: LoggedResult<()> = try {
-        decoder.write_all(in_bytes)?;
-        decoder.finish()?;
+        std::io::copy(decoder.as_mut(), out_file.deref_mut())?;
     };
 }
 
@@ -537,8 +345,8 @@ pub(crate) fn decompress(infile: &mut String, outfile: Option<&mut String>) -> L
         // strip the extension
         rm_in = true;
         let mut outfile = if let Some((outfile, ext)) = infile.rsplit_once('.') {
-            if ext != format.ext() {
-                log_err!("Input file is not a supported type!")?;
+            if ext != &format.ext()[1..] {
+                return log_err!("Input file is not a supported type!");
             }
             outfile.to_owned()
         } else {
@@ -591,7 +399,7 @@ pub(crate) fn compress(
         super let stdout = stdout();
         stdout.as_fd()
     } else {
-        let mut outfile = format!("{infile}.{}", method.ext());
+        let mut outfile = format!("{infile}{}", method.ext());
         eprintln!("Compressing to [{outfile}]");
         rm_in = true;
         super let outfile = Utf8CStr::from_string(&mut outfile).create(O_WRONLY | O_TRUNC, 0o644)?;
