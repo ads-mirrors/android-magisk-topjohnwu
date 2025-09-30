@@ -20,3 +20,4 @@ tools/elf-cleaner/** -binary
 *.png binary
 *.jpg binary
 *.ttf binary
+.github/ merge=ours
